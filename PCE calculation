@@ -1,0 +1,199 @@
+// The main code used to estimate park cooling effects is provided below.
+
+
+var global_urban = ee.FeatureCollection("projects/ee-continental/assets/GUB_2018_gt20_random1728")
+                     .map(function(each){return each.simplify(100)})
+//print("global_urban",global_urban)
+
+
+var global_urban_mask = ee.Image().toByte().paint(global_urban, 1)
+//Map.addLayer(global_urban_mask, {color:'00ff00'},"global_urban_mask")
+
+
+var elevation = ee.Image("USGS/SRTMGL1_003").select('elevation')
+
+
+var urban_median_ele = global_urban.map(function(each){
+  var ele = elevation.reduceRegion(ee.Reducer.median(),each.geometry(),30,null,null,false,10e12,8).getNumber('elevation')
+  return each.set('elevation',ele)
+})
+//print("urban_median_ele",urban_median_ele)
+
+
+var num_list = ee.List.sequence(0,30)
+
+var bandnames_LSTmean = num_list.map(function(each_num){
+    return ee.String(each_num).slice(0,-2).cat(ee.String('_LST_mean'))
+})
+
+var bandnames_NDVImean = num_list.map(function(each_num){
+    return ee.String(each_num).slice(0,-2).cat(ee.String('_NDVI_mean'))
+})
+
+var bandnames_ISPmean = num_list.map(function(each_num){
+    return ee.String(each_num).slice(0,-2).cat(ee.String('_ISP_mean'))
+})
+
+var bandnames_LSTcount = num_list.map(function(each_num){
+    return ee.String(each_num).slice(0,-2).cat(ee.String('_LST_count'))
+})
+
+
+var outputSelectors = ee.List(['PARK_ID', 'CITY_ID', 'Area', 'Buffer900m_ISP'])
+                        .cat(bandnames_LSTmean)
+                        .cat(bandnames_NDVImean)
+                        .cat(bandnames_ISPmean)
+                        .cat(bandnames_LSTcount)
+                        .getInfo()
+//print("outputSelectors",outputSelectors)
+
+
+
+var ISP = ee.Image("JRC/GHSL/P2016/BUILT_LDSMT_GLOBE_V1").select('cnfd').rename('ISP').divide(255)
+
+
+var landcover = ee.Image("ESA/WorldCover/v100/2020")
+
+
+var water_mask = landcover.updateMask(landcover.neq(80))
+var ISP_mask = landcover.updateMask(landcover.eq(50))
+
+
+var ISParea = ee.Image.pixelArea().updateMask(ISP_mask)
+//Map.addLayer(ISParea,{color:'00ff00'},"ISParea")
+
+
+//var visualization = {bands: ['Map'],}
+//print("landcover",landcover)
+//Map.addLayer(landcover,visualization,"landcover")
+
+
+var time_Filter = ee.Filter.and(ee.Filter.date('2017-03-01','2020-03-01'),ee.Filter.calendarRange(6,8,'month'))
+
+var date_start = '2017-03-01'
+var date_end = '2020-03-01'
+var use_ndvi = true
+
+var LandsatLST = require('users/continental/Correct_UTAI:modules/Landsat_LST.js')
+
+
+
+//-------------------------------iterate for each park in the given city-----------------------------------------
+
+var globalPark = ee.FeatureCollection("projects/ee-continental/assets/Global_park_within1728_allArea")
+
+var globalPark_mask = ee.Image().toByte().paint(globalPark, 1)
+var nonpark_mask = ee.Image(1).updateMask(globalPark_mask.mask().not())
+//Map.addLayer(nonpark_mask,{color:'ff0000'},"nonpark_mask")
+
+
+// Global_park_final_selection_68797      China_urban_park_gt10000
+var allpark = ee.FeatureCollection("projects/ee-continental/assets/Global_park_final_selection_68797_cityID")
+                .filter(ee.Filter.lt('Area',50000)) 
+                .filter(ee.Filter.gte('Y',0))
+
+//print("allpark",allpark.first())
+//Map.addLayer(allpark,{color:'00ff00'},"allpark")
+
+
+var park_id_list = allpark.aggregate_array('PARK_ID')
+print("park_id_list",park_id_list.size())
+
+var distance_list = ee.List.sequence(0,900,30) 
+
+
+for (var times = 0; times < 10000; times+=20){  
+
+    var final_fc = ee.FeatureCollection(park_id_list.slice(times,times+20).map(function(eachID){
+      
+      
+          var each_parkID = ee.Feature(allpark.filter(ee.Filter.eq('PARK_ID', eachID)).first())
+          //print("each_parkID",each_parkID)
+        
+        
+          var each_park_city_median_ele = ee.Feature(urban_median_ele.filter(ee.Filter.eq('cityID',each_parkID.getNumber('cityID'))).first())
+                                            .getNumber('elevation')
+          //print("each_park_city_median_ele",each_park_city_median_ele)
+  
+  
+          var ele_mask = elevation.updateMask(elevation.gte(each_park_city_median_ele.subtract(50)).and(elevation.lte(each_park_city_median_ele.add(50))))
+          //print("ele_mask",ele_mask)
+          
+        
+          var distanceImage = ee.Image().toByte().paint(each_parkID, 1)
+                                .fastDistanceTransform(30).sqrt()
+                                .multiply(ee.Image.pixelArea().sqrt())
+          
+          //print("distanceImage",distanceImage)               
+          //Map.addLayer(distanceImage, {min: 0, max: 70, palette: ['white', 'blue']}, "distanceImage");
+          
+    
+          // using the rectangle boundary of all urban parks
+          var park_bounds = each_parkID.geometry().bounds().buffer(900)     
+          //print("park_bounds",park_bounds)
+          //Map.addLayer(park_city,{color:'ff0000'},"park_city")
+          
+          var buffer_900m = each_parkID.geometry().buffer(900).difference(each_parkID.geometry())
+          //Map.addLayer(buffer_900m,{color:'ff0000'},'buffer_900m')
+          
+          var buffer_area = buffer_900m.area()
+          //print("buffer_area",buffer_area)
+          
+          var buffer_900m_isp = ISParea.reduceRegion(ee.Reducer.sum(),buffer_900m,30,null,null,false,10e12,8)
+                                       .getNumber('area')
+                                       .divide(buffer_area)
+          //print("buffer_900m_isp",buffer_900m_isp)
+          
+          
+          
+          var LandsatColl = LandsatLST.collection('L8', date_start, date_end, park_bounds, use_ndvi)
+                                      .filter(ee.Filter.lt('CLOUD_COVER', 30))
+                                      .filter(time_Filter)
+                                      .select(['LST', 'NDVI'])
+                                      .mean()
+                                      .updateMask(water_mask)
+                                      .addBands(ISP)
+          //Map.addLayer(LandsatColl.select('LST'), {min: 270, max: 320, palette: ['white', 'blue']}, "LandsatColl");
+    
+     
+          
+          var park_buffer = ee.ImageCollection(distance_list.map(function(each_distance){
+            
+            each_distance = ee.Number(each_distance)
+            
+            return ee.Algorithms.If(each_distance.eq(ee.Number(0)),
+                                    LandsatColl.updateMask(ele_mask).updateMask(distanceImage.eq(ee.Number(0))),
+                                    LandsatColl.updateMask(ele_mask).updateMask(distanceImage.gt(each_distance.subtract((ee.Number(30)))).and(distanceImage.lte(each_distance)))
+                                               .updateMask(nonpark_mask)
+                                               .updateMask(global_urban_mask)
+                                   )  
+            
+          })).toBands()
+          
+          //print("park_buffer",park_buffer)
+          //Map.addLayer(park_buffer.select('30_LST'),{color:'ff0000'},"park_buffer")
+          
+                
+          return ee.Feature(null,park_buffer.reduceRegion(ee.Reducer.mean().combine({reducer2:ee.Reducer.count(),sharedInputs: true}),park_bounds,30,null,null,false,10e12,8))
+                                           .set('PARK_ID',each_parkID.get('PARK_ID'))
+                                           .set('CITY_ID',each_parkID.getNumber('cityID'))
+                                           .set('Area',each_parkID.get('Area'))
+                                           .set('Buffer900m_ISP',buffer_900m_isp)
+                                           
+       
+          
+    }))
+    
+    print("final_fc",final_fc)
+    
+    
+    Export.table.toDrive({
+          collection: final_fc,
+          folder:'Landsat_Global_Park_LSTcooling_NH_withGUBPixel_ElevationControl_lt50000',
+          description: 'Landsat_Global_Park_LSTcooling_NH_withGUBPixel_ElevationControl_lt50000_'+times,
+          selectors: outputSelectors,
+          fileFormat: 'CSV'
+    })
+    
+}
+
